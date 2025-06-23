@@ -285,48 +285,141 @@
         </div>
     </div>
 
+    <!-- Socket.IO -->
+    <script src="/socket.io/socket.io.js"></script>
     <script>
-        // Simulated functionality (no real backend)
-        let isConnected = false;
-        let inCall = false;
+        // Socket.IO connection
+        const socket = io();
+        
+        // WebRTC variables
         let localStream = null;
+        let peerConnection = null;
+        let currentRoom = null;
+        let inCall = false;
 
         // Get elements
         const startCallBtn = document.getElementById('startCall');
         const endCallBtn = document.getElementById('endCall');
+        const acceptCallBtn = document.getElementById('acceptCall');
+        const rejectCallBtn = document.getElementById('rejectCall');
         const sendMessageBtn = document.getElementById('sendMessage');
         const messageInput = document.getElementById('messageInput');
         const chatBox = document.getElementById('chatBox');
         const status = document.getElementById('status');
         const videoSection = document.getElementById('videoSection');
         const localVideo = document.getElementById('localVideo');
+        const remoteVideo = document.getElementById('remoteVideo');
         const modal = document.getElementById('incomingCallModal');
 
-        // Initialize
-        setTimeout(() => {
-            status.textContent = '🟢 Connected! Ready to chat.';
+        // WebRTC configuration
+        const rtcConfig = {
+            iceServers: [
+                { urls: 'stun:stun.l.google.com:19302' }
+            ]
+        };
+
+        // Join room when page loads
+        socket.emit('joinroom');
+
+        // Socket event listeners
+        socket.on('joined', (roomName) => {
+            currentRoom = roomName;
+            status.textContent = '🟢 Connected! Ready to chat and call.';
             status.classList.add('connected');
-            isConnected = true;
-        }, 2000);
+            addMessage("Connected to chat room!", false);
+        });
+
+        socket.on('message', (message) => {
+            addMessage(message, false);
+        });
+
+        socket.on('incomingCall', (data) => {
+            modal.style.display = 'block';
+        });
+
+        socket.on('callAccepted', (data) => {
+            modal.style.display = 'none';
+            createPeerConnection();
+            startCall();
+        });
+
+        socket.on('callRejected', (data) => {
+            alert('Call was declined');
+        });
+
+        socket.on('callEnded', (data) => {
+            endCall();
+        });
+
+        socket.on('signalingMessage', async (data) => {
+            if (!peerConnection) return;
+            
+            const message = JSON.parse(data.message);
+            
+            if (message.type === 'offer') {
+                await peerConnection.setRemoteDescription(message.offer);
+                const answer = await peerConnection.createAnswer();
+                await peerConnection.setLocalDescription(answer);
+                
+                socket.emit('signalingMessage', {
+                    room: currentRoom,
+                    message: JSON.stringify({
+                        type: 'answer',
+                        answer: answer
+                    })
+                });
+            } else if (message.type === 'answer') {
+                await peerConnection.setRemoteDescription(message.answer);
+            } else if (message.type === 'candidate') {
+                await peerConnection.addIceCandidate(message.candidate);
+            }
+        });
+
+        socket.on('userDisconnected', (data) => {
+            addMessage("User disconnected", false);
+            endCall();
+        });
 
         // Event listeners
-        startCallBtn.addEventListener('click', startCall);
-        endCallBtn.addEventListener('click', endCall);
+        startCallBtn.addEventListener('click', () => {
+            if (currentRoom) {
+                socket.emit('startVideoCall', { room: currentRoom });
+                createPeerConnection();
+                startCall();
+            }
+        });
+
+        endCallBtn.addEventListener('click', () => {
+            if (currentRoom) {
+                socket.emit('endCall', { room: currentRoom });
+            }
+            endCall();
+        });
+
+        acceptCallBtn.addEventListener('click', () => {
+            socket.emit('acceptCall', { room: currentRoom });
+            modal.style.display = 'none';
+            createPeerConnection();
+            startCall();
+        });
+
+        rejectCallBtn.addEventListener('click', () => {
+            socket.emit('rejectCall', { room: currentRoom });
+            modal.style.display = 'none';
+        });
+
         sendMessageBtn.addEventListener('click', sendMessage);
         messageInput.addEventListener('keypress', (e) => {
             if (e.key === 'Enter') sendMessage();
         });
 
+        // Functions
         function sendMessage() {
             const message = messageInput.value.trim();
-            if (message) {
+            if (message && currentRoom) {
+                socket.emit('message', { room: currentRoom, message: message });
                 addMessage(message, true);
                 messageInput.value = '';
-                
-                // Simulate response
-                setTimeout(() => {
-                    addMessage("Hey! How are you?", false);
-                }, 1000);
             }
         }
 
@@ -338,45 +431,91 @@
             chatBox.scrollTop = chatBox.scrollHeight;
         }
 
+        function createPeerConnection() {
+            peerConnection = new RTCPeerConnection(rtcConfig);
+
+            // Add local stream to peer connection
+            if (localStream) {
+                localStream.getTracks().forEach(track => {
+                    peerConnection.addTrack(track, localStream);
+                });
+            }
+
+            // Handle remote stream
+            peerConnection.ontrack = (event) => {
+                remoteVideo.srcObject = event.streams[0];
+            };
+
+            // Handle ICE candidates
+            peerConnection.onicecandidate = (event) => {
+                if (event.candidate && currentRoom) {
+                    socket.emit('signalingMessage', {
+                        room: currentRoom,
+                        message: JSON.stringify({
+                            type: 'candidate',
+                            candidate: event.candidate
+                        })
+                    });
+                }
+            };
+        }
+
         async function startCall() {
             try {
+                // Get user media
                 localStream = await navigator.mediaDevices.getUserMedia({
                     video: true,
                     audio: true
                 });
-                
+
                 localVideo.srcObject = localStream;
                 videoSection.style.display = 'block';
                 inCall = true;
-                
-                // Simulate incoming call for demo
-                setTimeout(() => {
-                    if (inCall) {
-                        alert('Call connected!');
-                    }
-                }, 2000);
-                
+
+                // Add tracks to peer connection if it exists
+                if (peerConnection && localStream) {
+                    localStream.getTracks().forEach(track => {
+                        peerConnection.addTrack(track, localStream);
+                    });
+
+                    // Create offer
+                    const offer = await peerConnection.createOffer();
+                    await peerConnection.setLocalDescription(offer);
+
+                    socket.emit('signalingMessage', {
+                        room: currentRoom,
+                        message: JSON.stringify({
+                            type: 'offer',
+                            offer: offer
+                        })
+                    });
+                }
+
             } catch (error) {
+                console.error('Error starting call:', error);
                 alert('Could not access camera/microphone');
             }
         }
 
         function endCall() {
+            // Stop local stream
             if (localStream) {
                 localStream.getTracks().forEach(track => track.stop());
+                localStream = null;
             }
-            
+
+            // Close peer connection
+            if (peerConnection) {
+                peerConnection.close();
+                peerConnection = null;
+            }
+
+            // Hide video section
             videoSection.style.display = 'none';
             localVideo.srcObject = null;
+            remoteVideo.srcObject = null;
             inCall = false;
         }
-
-        // Add some demo messages
-        setTimeout(() => {
-            if (isConnected) {
-                addMessage("Welcome to YAP!", false);
-            }
-        }, 3000);
     </script>
 </body>
 </html>
